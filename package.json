@@ -1,0 +1,8 @@
+{
+  "name": "localwp-test-skill",
+  "private": true,
+  "description": "localwp-test skill 的瀏覽器測試相依套件（安裝在 skill 目錄內，避免裝進家目錄）",
+  "dependencies": {
+    "puppeteer-core": "^24.43.1"
+  }
+}

@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# lwp — LocalWP 站台測試工具（localwp-test skill 的單一入口）
+# 用法：lwp <站台> <子指令> [參數...]；lwp list；lwp help
+set -o pipefail
+
+# 平台差異：Windows（Git Bash）有 cygpath，需要在 Unix／Windows 路徑之間轉換；Linux、macOS 原樣使用
+if command -v cygpath >/dev/null 2>&1; then
+	to_mixed() { cygpath -m "$1"; }; to_unix() { cygpath -u "$1"; }; to_win() { cygpath -w "$1"; }; PATH_SEP=';'
+else
+	to_mixed() { echo "$1"; }; to_unix() { echo "$1"; }; to_win() { echo "$1"; }; PATH_SEP=':'
+fi
+# Windows 通常只有 python；Linux、macOS 通常只有 python3
+PY="$(command -v python3 || command -v python)"
+[ -z "$PY" ] && { echo "lwp: 找不到 python3 或 python" >&2; exit 2; }
+python() { "$PY" "$@"; }
+
+SKILL_DIR="$(to_mixed "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)")"
+LIB="$SKILL_DIR/lib"
+export PYTHONIOENCODING=utf-8
+
+usage() {
+	cat <<'EOF'
+lwp — LocalWP 站台測試工具
+
+  lwp list                              列出所有 Local 站台
+  lwp <站台> info                       站台環境摘要（PHP、DB、網址、外掛狀態）
+  lwp <站台> wp <WP-CLI 參數...>         執行 WP-CLI（破壞性操作需加 --lwp-yes）
+  lwp <站台> php <參數...>               以站台的 PHP 與 php.ini 執行
+  lwp <站台> node <腳本.js> [參數...]     執行 node 腳本（環境變數含 LWP_PUBLIC 等站台路徑；找不到時改找輸出目錄）
+  lwp <站台> grep <正規式> [路徑...] [grep 選項]  唯讀搜尋（相對路徑以站台 public 為準，可用絕對路徑）
+  lwp <站台> cat <檔案> [起-迄]           唯讀顯示檔案（含行號，預設前 200 行）
+  lwp <站台> tmp put <檔案...> --to=<wp-content 下的目錄>  放入測試用暫存檔並記錄（不覆蓋既有檔案）
+  lwp <站台> tmp list|clear              列出／清除 lwp 放入的暫存檔（只刪內容未被改過的）
+  lwp <站台> lint <目錄...> [--php=7.4,8.4]  PHP 語法檢查（預設用站台的 PHP 版本）
+  lwp <站台> sql "<SELECT ...>" [table|json|csv]  唯讀查詢，{prefix} 會換成資料表前綴
+  lwp <站台> cookie [使用者]              產生登入 cookie（預設第一個 administrator）
+  lwp <站台> get <路徑> [--save=檔案] [--grep=正規式...]  以登入身分請求頁面，回報狀態、PHP 錯誤字樣與內容比對
+  lwp <站台> browser start|stop|status  背景無頭 Edge（CDP 埠預設 9333）
+  lwp <站台> smoke [--all-admin] [--no-shots] [--raw] [路徑...]  瀏覽器冒煙測試（--raw 不過濾已知雜訊）
+  lwp <站台> shot <路徑> [名稱]           單頁截圖
+  lwp <站台> run <腳本.js> [參數...]      執行自訂瀏覽器腳本（可 require('lwp-browser')；找不到時改找輸出目錄）
+  lwp <站台> debug on|off|status|log [行數]|clear   WP_DEBUG_LOG 開關（off 會還原原值）
+  lwp <站台> debug summary [--all|--date=YYYY-MM-DD] [筆數]  依類型＋檔案分組統計 debug.log（預設只看今天）
+  lwp <站台> httplog on|off|show|clear  記錄對外 HTTP 請求的臨時 mu-plugin
+  lwp <站台> httplog block <網域...>|unblock  擋下對指定網域（含子網域）的請求並記錄
+  lwp <站台> snapshot [名稱]|list         以 wp db export 備份資料庫
+  lwp <站台> restore <名稱> --lwp-yes     還原資料庫快照（破壞性）
+  lwp <站台> cleanup                     debug off + httplog off + tmp clear + browser stop
+
+輸出目錄：<站台>/app/.lwp-test（可用 LWP_OUT 覆寫）
+EOF
+}
+
+case "${1:-}" in
+	''|help|-h|--help) usage; exit 0 ;;
+	list) python "$LIB/site.py" list; exit $? ;;
+esac
+
+SITE="$1"; shift
+CMD="${1:-info}"; [ $# -gt 0 ] && shift
+
+eval "$(python "$LIB/site.py" env "$SITE" | tr -d $'\r')" || exit 2
+
+OUT="${LWP_OUT:-$LWP_SITE_DIR/app/.lwp-test}"
+mkdir -p "$OUT"
+export LWP_OUT="$OUT"
+export MYSQL_HOME="$LWP_MYSQL_HOME" WP_CLI_CONFIG_PATH="$LWP_WPCLI_CONFIG" MYSQL_TCP_PORT="$LWP_DB_PORT"
+[ -n "$LWP_MYSQL_BIN_DIR" ] && export PATH="$(to_unix "$LWP_MYSQL_BIN_DIR"):$PATH"
+CDP_PORT="${LWP_CDP_PORT:-9333}"
+export LWP_CDP="http://127.0.0.1:$CDP_PORT"
+CONTENT="$LWP_PUBLIC/wp-content"
+
+db_up() { (exec 3<>"/dev/tcp/127.0.0.1/$LWP_DB_PORT") 2>/dev/null; }
+need_db() {
+	db_up || { echo "lwp: 站台「$LWP_NAME」的資料庫（port $LWP_DB_PORT）沒有回應，請先在 LocalWP 啟動站台。" >&2; exit 3; }
+}
+
+# 執行 Local 內建的 PHP。Linux／macOS 版的 PHP 依賴同目錄的 shared-libs（例如 libtidy），
+# 只對這個程序設定 LD_LIBRARY_PATH／DYLD_LIBRARY_PATH，不影響 curl、node 等其他指令
+php_exec() {
+	local bin="$1"; shift
+	local libs; libs="$(dirname "$(dirname "$bin")")/shared-libs"
+	if [ "$LWP_PLATFORM" = linux ] && [ -d "$libs" ]; then
+		LD_LIBRARY_PATH="$libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$bin" "$@"
+	elif [ "$LWP_PLATFORM" = mac ] && [ -d "$libs" ]; then
+		DYLD_LIBRARY_PATH="$libs${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" "$bin" "$@"
+	else
+		"$bin" "$@"
+	fi
+}
+
+wpcli() {
+	php_exec "$LWP_PHP" -c "$LWP_PHP_INI" -d display_startup_errors=0 "$LWP_WPCLI" --path="$LWP_PUBLIC" "$@"
+}
+
+# 破壞性 WP-CLI 操作必須明確加上 --lwp-yes（代表已取得使用者同意）
+guard_wp() {
+	local joined=" $* "
+	[[ "$joined" == *" --lwp-yes "* ]] && return 0  # 已取得使用者同意
+	local pattern=' (db (reset|drop|clean|import)|site (empty|delete)|plugin (delete|uninstall)|theme delete|user delete|core (update|download)|search-replace|(option|post|term|comment|menu|widget|transient|site option|user meta|post meta|term meta|comment meta|network meta|role|cap|cron event) (delete|remove|empty)|post (generate|update)|media regenerate|rewrite flush --hard|cache flush) '
+	if [[ "$joined" =~ $pattern ]] && [[ "$joined" != *" --dry-run "* ]]; then
+		echo "lwp: 「wp ${BASH_REMATCH[1]}」會刪除或大量改動資料。取得使用者明確同意後，加上 --lwp-yes 再執行。" >&2
+		exit 4
+	fi
+	# wp db query：只允許唯讀查詢
+	if [[ "$joined" == *" db query "* ]] && grep -qiE '\b(delete|drop|truncate|update|alter|replace|insert|rename|create)\b' <<<"$joined"; then
+		echo "lwp: 這個 wp db query 會改動資料。唯讀查詢請用 lwp <站台> sql；確定要改動時取得使用者同意後加上 --lwp-yes。" >&2
+		exit 4
+	fi
+}
+
+ensure_cookie() {
+	local meta="$OUT/cookies.txt.meta" now exp
+	now=$(date +%s)
+	exp=$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['expires'])" "$meta" 2>/dev/null | tr -d $'\r'); exp=${exp:-0}
+	if [ ! -f "$OUT/cookies.txt" ] || [ "$exp" -lt $((now + 600)) ]; then
+		need_db
+		wpcli eval-file "$LIB/cookie.php" "$OUT/cookies.txt" >/dev/null || { echo "lwp: 產生 cookie 失敗" >&2; exit 5; }
+	fi
+}
+
+base_url() { python -c "import json,sys;print(json.load(open(sys.argv[1]))['home'].rstrip('/'))" "$OUT/cookies.txt.meta" | tr -d $'\r'; }
+
+browser_bin() {
+	local c
+	[ -n "$LWP_BROWSER" ] && { echo "$LWP_BROWSER"; return; }  # 可用環境變數指定瀏覽器
+	case "$LWP_PLATFORM" in
+		windows)
+			for c in "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" "/c/Program Files/Microsoft/Edge/Application/msedge.exe" \
+			         "/c/Program Files/Google/Chrome/Application/chrome.exe"; do
+				[ -f "$c" ] && { echo "$c"; return; }
+			done ;;
+		mac)
+			for c in "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+			         "/Applications/Chromium.app/Contents/MacOS/Chromium"; do
+				[ -f "$c" ] && { echo "$c"; return; }
+			done ;;
+		*)
+			for c in microsoft-edge microsoft-edge-stable google-chrome google-chrome-stable chromium chromium-browser; do
+				command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return; }
+			done ;;
+	esac
+}
+browser_up() { curl -s --max-time 2 "$LWP_CDP/json/version" >/dev/null 2>&1; }
+# 瀏覽器設定檔放在使用者快取目錄（數百 MB），不放進 skill 目錄，避免同步或打包 skill 時被帶走
+# Windows：%LOCALAPPDATA%\localwp-test；macOS：~/Library/Caches/localwp-test；Linux：$XDG_CACHE_HOME 或 ~/.cache/localwp-test
+cache_dir() {
+	case "$LWP_PLATFORM" in
+		windows) echo "$(to_unix "${LOCALAPPDATA:-$HOME/AppData/Local}")/localwp-test" ;;
+		mac) echo "$HOME/Library/Caches/localwp-test" ;;
+		*) echo "${XDG_CACHE_HOME:-$HOME/.cache}/localwp-test" ;;
+	esac
+}
+browser_profile() {
+	if [ "$LWP_PLATFORM" = windows ]; then echo "$(to_win "$(cache_dir)")\\browser-$CDP_PORT"
+	else echo "$(cache_dir)/browser-$CDP_PORT"; fi
+}
+browser_start() {
+	browser_up && return 0
+	local bin; bin="$(browser_bin)"
+	[ -z "$bin" ] && { echo "lwp: 找不到 Edge 或 Chrome" >&2; exit 6; }
+	mkdir -p "$(cache_dir)"
+	("$bin" --headless=new --remote-debugging-port="$CDP_PORT" --no-first-run --no-default-browser-check \
+		--ignore-certificate-errors --user-data-dir="$(browser_profile)" about:blank >/dev/null 2>&1 &)
+	for _ in $(seq 1 20); do browser_up && return 0; sleep 0.5; done
+	echo "lwp: 瀏覽器啟動失敗（CDP $LWP_CDP 沒有回應）" >&2; exit 6
+}
+browser_stop() {
+	# 只停止使用本 skill 設定檔目錄（<快取目錄>/localwp-test/browser-<埠>）的瀏覽器程序，不影響使用者自己開的瀏覽器
+	if [ "$LWP_PLATFORM" = windows ]; then
+		powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | Where-Object { \$_.CommandLine -like '*localwp-test*browser-$CDP_PORT*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1
+	else
+		pkill -f -- "--user-data-dir=$(browser_profile)( |$)" 2>/dev/null
+	fi
+	sleep 1
+	browser_up && echo "lwp: 瀏覽器仍在執行" >&2 || echo "瀏覽器已停止"
+}
+
+node_path() { export NODE_PATH="$(to_win "$SKILL_DIR/node_modules")$PATH_SEP$(to_win "$LIB/node_modules_local")"; }
+node_run() {
+	node_path
+	# 關閉 Git Bash 的路徑轉換，否則 /wp-admin/... 會被改成 C:/Program Files/Git/wp-admin/...
+	MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' node "$LIB/browser.js" "$@"
+}
+
+# 站台路徑解析：絕對路徑原樣使用；相對路徑若在目前目錄存在就用，否則以站台 public 為準
+site_path() {
+	local p="$1"
+	if [[ "$p" == /* || "$p" =~ ^[A-Za-z]: ]]; then echo "$p"
+	elif [ -e "$p" ]; then echo "$p"
+	else echo "$LWP_PUBLIC/$p"; fi
+}
+# 腳本路徑解析：找不到時改找輸出目錄（.lwp-test）
+script_path() {
+	local p="$1"
+	if [ -f "$p" ]; then echo "$p"; elif [ -f "$OUT/$p" ]; then echo "$OUT/$p"; else echo "$p"; fi
+}
+
+php_for_version() {
+	local v="$1" p
+	p=$(ls -d "$(to_unix "$LWP_SERVICES")/php-$v"* 2>/dev/null | sort -r | head -1)
+	[ -n "$p" ] && for f in "$p/bin/win64/php.exe" "$p/bin/win32/php.exe" "$p/bin/linux/bin/php" "$p/bin/darwin-arm64/bin/php" "$p/bin/darwin/bin/php"; do
+		[ -f "$f" ] && { echo "$f"; return; }
+	done
+}
+
+case "$CMD" in
+	info)
+		echo "站台      $LWP_NAME（$LWP_DOMAIN）  id=$LWP_ID"
+		echo "路徑      $LWP_PUBLIC"
+		echo "PHP       $LWP_PHP_VERSION  $LWP_PHP"
+		echo "資料庫    $LWP_DB_VERSION  port $LWP_DB_PORT  $(db_up && echo '運作中' || echo '未啟動')"
+		echo "多站台    ${LWP_MULTISITE:-否}"
+		echo "輸出目錄  $OUT"
+		echo "瀏覽器    $(browser_up && echo "運作中（$LWP_CDP）" || echo '未啟動')"
+		if db_up; then
+			echo "網址      $(wpcli option get home 2>/dev/null)"
+			echo "WordPress $(wpcli core version 2>/dev/null)"
+			echo "--- 外掛"; wpcli plugin list --fields=name,status,version 2>/dev/null
+		fi
+		;;
+	wp)
+		guard_wp "$@"
+		args=(); for a in "$@"; do [ "$a" != "--lwp-yes" ] && args+=("$a"); done
+		need_db; wpcli "${args[@]}"
+		;;
+	php)
+		php_exec "$LWP_PHP" -c "$LWP_PHP_INI" -d display_startup_errors=0 "$@"
+		;;
+	lint)
+		versions=("$LWP_PHP_VERSION"); dirs=()
+		for a in "$@"; do
+			case "$a" in --php=*) IFS=',' read -r -a extra <<<"${a#--php=}"; versions+=("${extra[@]}") ;; *) dirs+=("$a") ;; esac
+		done
+		[ ${#dirs[@]} -eq 0 ] && { echo "用法：lwp <站台> lint <目錄...> [--php=7.4,8.4]" >&2; exit 1; }
+		rc=0
+		for v in "${versions[@]}"; do
+			bin=$([ "$v" = "$LWP_PHP_VERSION" ] && echo "$LWP_PHP" || php_for_version "$v")
+			[ -z "$bin" ] && { echo "== PHP $v：Local 沒有安裝這個版本，略過"; continue; }
+			real=$(php_exec "$bin" -n -r 'echo PHP_VERSION;')
+			# xargs 無法呼叫 shell 函式，所以把 shared-libs 路徑直接設在 xargs 的環境
+			libs="$(dirname "$(dirname "$bin")")/shared-libs"
+			res=$(find "${dirs[@]}" -name '*.php' -print0 | LD_LIBRARY_PATH="$libs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" DYLD_LIBRARY_PATH="$libs" \
+				xargs -0 -P 8 -n 1 sh -c '"$0" -n -d display_startup_errors=0 -l "$1"; exit 0' "$bin" 2>&1)  # php 遇到語法錯誤回傳 255，xargs 會因此中止，所以一律回傳 0
+			ok=$(grep -c '^No syntax errors' <<<"$res"); bad=$(grep -v '^No syntax errors' <<<"$res" | grep -v '^\s*$')
+			echo "== PHP $real：通過 $ok 個檔案$([ -n "$bad" ] && echo '，有錯誤：' || echo '，沒有錯誤')"
+			[ -n "$bad" ] && { echo "$bad"; rc=1; }
+		done
+		exit $rc
+		;;
+	sql)
+		need_db; wpcli eval-file "$LIB/sql.php" "$@"
+		;;
+	cookie)
+		need_db; wpcli eval-file "$LIB/cookie.php" "$OUT/cookies.txt" "$@"
+		;;
+	get)
+		ensure_cookie
+		path="${1:-/wp-admin/}"; save="$OUT/last-get.html"; greps=()
+		for a in "${@:2}"; do
+			[[ "$a" == --save=* ]] && save="${a#--save=}"
+			[[ "$a" == --grep=* ]] && greps+=("${a#--grep=}")
+		done
+		res=$(curl -sk -b "$OUT/cookies.txt" -o "$save" -w '%{http_code} %{size_download}B %{time_total}s' "$(base_url)$path")
+		errs=$(grep -ciE '<b>(fatal error|parse error|warning|notice|deprecated)</b>|critical error|wp-die-message' "$save")
+		title=$(grep -o '<title>[^<]*' "$save" | head -1 | sed 's/<title>//; s/&lsaquo;.*//; s/&#8212;.*//')
+		echo "$res  PHP錯誤字樣:$errs  標題:$title  → $save"
+		for g in "${greps[@]}"; do
+			n=$(grep -cE -- "$g" "$save")
+			echo "grep「$g」：$n 行符合"
+			if [ "$n" -gt 0 ]; then grep -oE -- ".{0,60}($g).{0,60}" "$save" | head -3 | sed 's/^/    /'; fi
+		done
+		true
+		;;
+	browser)
+		case "${1:-status}" in
+			start) browser_start && echo "瀏覽器運作中（$LWP_CDP）" ;;
+			stop) browser_stop ;;
+			status) browser_up && echo "運作中（$LWP_CDP）" || echo "未啟動" ;;
+			*) echo "用法：browser start|stop|status" >&2; exit 1 ;;
+		esac
+		;;
+	node)
+		# 執行一般 node 腳本（不需瀏覽器）；腳本可 require('lwp-browser') 以外的任何套件
+		[ $# -lt 1 ] && { echo "用法：lwp <站台> node <腳本.js> [參數...]" >&2; exit 1; }
+		node_path
+		export LWP_PUBLIC LWP_SITE_DIR LWP_PHP LWP_PHP_INI
+		script="$(script_path "$1")"; shift
+		MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' node "$script" "$@"
+		;;
+	smoke|shot|run)
+		ensure_cookie; browser_start
+		export LWP_BASE="$(base_url)"
+		if [ "$CMD" = run ] && [ $# -gt 0 ]; then first="$(script_path "$1")"; shift; set -- "$first" "$@"; fi
+		node_run "$CMD" "$@"
+		;;
+	debug)
+		state="$OUT/debug-state.json"
+		case "${1:-status}" in
+			on)
+				need_db
+				if [ ! -f "$state" ]; then
+					{
+						echo '{'
+						first=1
+						for c in WP_DEBUG WP_DEBUG_LOG WP_DEBUG_DISPLAY; do
+							if wpcli config has "$c" 2>/dev/null; then v=$(wpcli config get "$c" --format=json 2>/dev/null); else v='"__absent__"'; fi
+							[ $first -eq 0 ] && echo ','; first=0
+							printf '"%s": %s' "$c" "$v"
+						done
+						echo '}'
+					} >"$state"
+				fi
+				[ -f "$OUT/wp-config.before-debug.php" ] || cp "$LWP_PUBLIC/wp-config.php" "$OUT/wp-config.before-debug.php"
+				wpcli config set WP_DEBUG true --raw --quiet && wpcli config set WP_DEBUG_LOG true --raw --quiet && wpcli config set WP_DEBUG_DISPLAY false --raw --quiet
+				md5sum "$LWP_PUBLIC/wp-config.php" | cut -d' ' -f1 >"$OUT/wp-config.after-debug.md5"
+				echo "除錯紀錄已開啟（原檔備份於 $OUT/wp-config.before-debug.php）"
+				;;
+			off)
+				[ ! -f "$state" ] && { echo "沒有記錄到原值，未變更 wp-config.php"; exit 0; }
+				# 如果開啟後 wp-config.php 沒被其他人改過，直接放回原檔（位元組完全一致，包含換行字元）
+				if [ -f "$OUT/wp-config.before-debug.php" ] && [ -f "$OUT/wp-config.after-debug.md5" ] \
+				   && [ "$(md5sum "$LWP_PUBLIC/wp-config.php" | cut -d' ' -f1)" = "$(cat "$OUT/wp-config.after-debug.md5")" ]; then
+					cp "$OUT/wp-config.before-debug.php" "$LWP_PUBLIC/wp-config.php"
+					rm -f "$state" "$OUT/wp-config.before-debug.php" "$OUT/wp-config.after-debug.md5"
+					echo "除錯設定已還原（放回原檔）"; exit 0
+				fi
+				echo "wp-config.php 在開啟除錯後有其他修改，改為逐一還原常數（換行字元可能被 WP-CLI 正規化）"
+				need_db
+				python - "$state" <<'PY' | while IFS=$'\t' read -r c v; do
+import json, sys
+for k, v in json.load(open(sys.argv[1])).items():
+    print(k + '\t' + ('__absent__' if v == '__absent__' else json.dumps(v)))
+PY
+					c="${c%$'\r'}"; v="${v%$'\r'}"  # Windows 的 Python 輸出為 CRLF
+					if [ "$v" = "__absent__" ]; then wpcli config delete "$c" --quiet 2>/dev/null; else wpcli config set "$c" "$v" --raw --quiet; fi
+				done
+				rm -f "$state" "$OUT/wp-config.before-debug.php" "$OUT/wp-config.after-debug.md5"; echo "除錯設定已還原（逐一還原常數）"
+				;;
+			status) for c in WP_DEBUG WP_DEBUG_LOG WP_DEBUG_DISPLAY; do printf '%-17s %s\n' "$c" "$(wpcli config get "$c" 2>/dev/null || echo '(未定義)')"; done ;;
+			log) [ -f "$CONTENT/debug.log" ] && tail -n "${2:-50}" "$CONTENT/debug.log" || echo "（debug.log 不存在或是空的）" ;;
+			clear) rm -f "$CONTENT/debug.log"; echo "debug.log 已清除" ;;
+			summary)
+				# 依「錯誤類型＋訊息＋檔案」分組計數；訊息中的數字（ID、時間戳記）會被遮掉，避免同一類錯誤被拆成很多組
+				[ -s "$CONTENT/debug.log" ] || { echo "（debug.log 不存在或是空的）"; exit 0; }
+				shift; day="$(LC_ALL=C date +%d-%b-%Y)"; top=30
+				for a in "$@"; do
+					case "$a" in
+						--all) day="" ;;
+						--date=*) day="$(LC_ALL=C date -d "${a#--date=}" +%d-%b-%Y 2>/dev/null)" || { echo "lwp: 日期格式請用 YYYY-MM-DD" >&2; exit 1; } ;;
+						*[!0-9]*) echo "用法：debug summary [--all|--date=YYYY-MM-DD] [筆數]" >&2; exit 1 ;;
+						*) top="$a" ;;
+					esac
+				done
+				echo "== debug.log 分組統計（${day:-全部日期}，前 $top 組；路徑相對於 public）"
+				grep -aF -- "${day:+[$day}" "$CONTENT/debug.log" \
+					| grep -aoE 'PHP (Fatal error|Parse error|Warning|Deprecated|Notice):.*|WordPress database error.*' \
+					| sed -E "s#$LWP_PUBLIC/##g; s/[0-9]{5,}/N/g" | cut -c1-220 \
+					| sort | uniq -c | sort -rn | head -n "$top"
+				echo "== 各類型總數"
+				grep -aF -- "${day:+[$day}" "$CONTENT/debug.log" | grep -aoE 'PHP (Fatal error|Parse error|Warning|Deprecated|Notice)|WordPress database error' \
+					| sort | uniq -c | sort -rn
+				true
+				;;
+			*) echo "用法：debug on|off|status|log [行數]|clear|summary" >&2; exit 1 ;;
+		esac
+		;;
+	httplog)
+		mu="$CONTENT/mu-plugins"; f="$mu/zz-lwp-http-logger.php"; log="$CONTENT/lwp-http-log.txt"
+		case "${1:-show}" in
+			on) [ -d "$mu" ] || { mkdir -p "$mu"; touch "$OUT/.mu-created"; }; cp "$LIB/http-logger.php" "$f"; echo "已安裝 $f" ;;
+			off)
+				# 只回報實際存在而被移除的項目，避免沒裝過也顯示「已移除」
+				removed=()
+				[ -f "$f" ] && removed+=("HTTP 紀錄器"); [ -f "$log" ] && removed+=("紀錄檔"); [ -f "$CONTENT/lwp-http-block.txt" ] && removed+=("封鎖清單")
+				rm -f "$f" "$log" "$CONTENT/lwp-http-block.txt"; [ -f "$OUT/.mu-created" ] && rmdir "$mu" 2>/dev/null; rm -f "$OUT/.mu-created"
+				if [ ${#removed[@]} -gt 0 ]; then joined="${removed[0]}"; for x in "${removed[@]:1}"; do joined+="、$x"; done; echo "已移除 $joined"; else echo "（沒有啟用 HTTP 紀錄器，不需移除）"; fi
+				;;
+			block)
+				shift
+				[ $# -eq 0 ] && { echo "用法：httplog block <網域...>（子網域也會被擋）" >&2; exit 1; }
+				[ -f "$f" ] || { [ -d "$mu" ] || { mkdir -p "$mu"; touch "$OUT/.mu-created"; }; cp "$LIB/http-logger.php" "$f"; }
+				cp "$LIB/http-logger.php" "$f"  # 確保是支援封鎖的最新版
+				for h in "$@"; do grep -qxF "$h" "$CONTENT/lwp-http-block.txt" 2>/dev/null || echo "$h" >>"$CONTENT/lwp-http-block.txt"; done
+				echo "封鎖中的網域："; cat "$CONTENT/lwp-http-block.txt"
+				;;
+			unblock) rm -f "$CONTENT/lwp-http-block.txt"; echo "已清除封鎖清單" ;;
+			show)
+				[ -f "$log" ] || { echo "（沒有任何對外請求紀錄）"; exit 0; }
+				echo "== 依網域統計"; awk -F'\t' '{split($3,u,"/"); print u[3]}' "$log" | sort | uniq -c | sort -rn
+				echo "== 由外掛／佈景主題發出的請求"; awk -F'\t' '$4!="" {print $2, $3, "←", $4, $5}' "$log" | sort | uniq -c | sort -rn | head -30
+				echo "== 被封鎖的請求"; grep -P '\tBLOCKED$' "$log" | awk -F'\t' '{print $2, $3, "←", $4}' | sort | uniq -c | sort -rn || echo "（無）"
+				;;
+			clear) rm -f "$log"; echo "紀錄已清除" ;;
+			*) echo "用法：httplog on|off|show|clear" >&2; exit 1 ;;
+		esac
+		;;
+	snapshot)
+		mkdir -p "$OUT/snapshots"
+		if [ "${1:-}" = list ]; then ls -la "$OUT/snapshots"; exit 0; fi
+		need_db
+		name="${1:-$(date +%Y%m%d-%H%M%S)}"; file="$OUT/snapshots/$name.sql"
+		wpcli db export "$file" --quiet && echo "快照已存：$file（$(du -h "$file" | cut -f1)）"
+		;;
+	restore)
+		[[ " $* " != *" --lwp-yes "* ]] && { echo "lwp: restore 會覆蓋整個資料庫。取得使用者明確同意後加上 --lwp-yes。" >&2; exit 4; }
+		file="$OUT/snapshots/${1}.sql"; [ -f "$file" ] || { echo "找不到快照 $file" >&2; exit 1; }
+		need_db; wpcli db import "$file" && echo "已還原 $file"
+		;;
+	grep)
+		# 唯讀搜尋；選項（-i、--include=*.php 等）原樣傳給 grep
+		[ $# -lt 1 ] && { echo "用法：lwp <站台> grep <正規式> [路徑...] [grep 選項]" >&2; exit 1; }
+		pattern="$1"; shift; opts=(); paths=()
+		for a in "$@"; do if [[ "$a" == -* ]]; then opts+=("$a"); else paths+=("$(site_path "$a")"); fi; done
+		[ ${#paths[@]} -eq 0 ] && paths=("$LWP_PUBLIC/wp-content")
+		grep -rnIE "${opts[@]}" -- "$pattern" "${paths[@]}" | head -n "${LWP_GREP_MAX:-200}"
+		true
+		;;
+	cat)
+		[ $# -lt 1 ] && { echo "用法：lwp <站台> cat <檔案> [起-迄]" >&2; exit 1; }
+		f="$(site_path "$1")"; [ -f "$f" ] || { echo "找不到 $f" >&2; exit 1; }
+		range="${2:-1-200}"; from="${range%-*}"; to="${range#*-}"
+		awk -v a="$from" -v b="$to" 'NR>=a && NR<=b { printf "%6d│%s\n", NR, $0 } NR>b { exit }' "$f"
+		;;
+	tmp)
+		# 測試用暫存檔：放入時記錄路徑與 md5，清除時只刪「lwp 放的、內容沒被改過」的檔案
+		man="$OUT/tmp-manifest.tsv"; touch "$man"
+		case "${1:-list}" in
+			put)
+				shift; dest=""; srcs=()
+				for a in "$@"; do case "$a" in --to=*) dest="${a#--to=}" ;; *) srcs+=("$a") ;; esac; done
+				if [ -z "$dest" ] || [ ${#srcs[@]} -eq 0 ]; then echo "用法：tmp put <檔案...> --to=<wp-content 下的目錄>" >&2; exit 1; fi
+				if [[ "$dest" == *..* || "$dest" == /* || "$dest" =~ ^[A-Za-z]: ]]; then echo "lwp: --to 必須是 wp-content 底下的相對路徑" >&2; exit 1; fi
+				ddir="$CONTENT/$dest"
+				# 逐層記錄 lwp 新建的目錄（由淺到深），清除時才能一層層移除
+				if [ ! -d "$ddir" ]; then
+					newdirs=(); d="$ddir"
+					while [ ! -d "$d" ]; do newdirs=("$d" "${newdirs[@]}"); d="$(dirname "$d")"; done
+					mkdir -p "$ddir"
+					for d in "${newdirs[@]}"; do printf 'DIR\t%s\t-\n' "$d" >>"$man"; done
+				fi
+				rc=0
+				for src in "${srcs[@]}"; do
+					[ -f "$src" ] || { echo "找不到 $src" >&2; rc=1; continue; }
+					t="$ddir/$(basename "$src")"
+					if [ -e "$t" ] && ! grep -qF "$(printf 'FILE\t%s\t' "$t")" "$man"; then
+						echo "lwp: $t 原本就存在（不是 lwp 放的），不覆蓋" >&2; rc=1; continue
+					fi
+					cp "$src" "$t"
+					grep -vF "$(printf 'FILE\t%s\t' "$t")" "$man" >"$man.new"; mv "$man.new" "$man"
+					printf 'FILE\t%s\t%s\n' "$t" "$(md5sum "$t" | cut -d' ' -f1)" >>"$man"
+					echo "已放入 $t"
+				done
+				exit $rc
+				;;
+			list)
+				[ -s "$man" ] || { echo "（沒有 lwp 放入的暫存檔）"; exit 0; }
+				while IFS=$'\t' read -r kind p sum; do
+					if [ "$kind" = DIR ]; then echo "目錄  $p"; continue; fi
+					if [ ! -e "$p" ]; then st="已不存在"; elif [ "$(md5sum "$p" | cut -d' ' -f1)" = "$sum" ]; then st="未變動"; else st="已被修改"; fi
+					echo "檔案  $p（$st）"
+				done <"$man"
+				;;
+			clear)
+				[ -s "$man" ] || { echo "（沒有 lwp 放入的暫存檔）"; exit 0; }
+				keep="$man.keep"; : >"$keep"; dirs=()
+				while IFS=$'\t' read -r kind p sum; do
+					if [ "$kind" = DIR ]; then dirs+=("$p"); continue; fi
+					[ -e "$p" ] || continue
+					if [ "$(md5sum "$p" | cut -d' ' -f1)" = "$sum" ]; then rm -f "$p" && echo "已移除 $p"
+					else echo "保留 $p：放入後內容被修改，可能已有其他用途，請使用者確認後手動處理" >&2; printf 'FILE\t%s\t%s\n' "$p" "$sum" >>"$keep"; fi
+				done <"$man"
+				# 只移除 lwp 建立、而且已經空了的目錄（由深到淺）
+				for ((i=${#dirs[@]}-1; i>=0; i--)); do
+					if rmdir "${dirs[$i]}" 2>/dev/null; then echo "已移除空目錄 ${dirs[$i]}"; else printf 'DIR\t%s\t-\n' "${dirs[$i]}" >>"$keep"; fi
+				done
+				mv "$keep" "$man"; [ -s "$man" ] || rm -f "$man"
+				;;
+			*) echo "用法：tmp put|list|clear" >&2; exit 1 ;;
+		esac
+		;;
+	cleanup)
+		"$0" "$SITE" debug off; "$0" "$SITE" httplog off; "$0" "$SITE" tmp clear; "$0" "$SITE" browser stop
+		;;
+	*)
+		echo "lwp: 未知的子指令「$CMD」" >&2; usage; exit 1
+		;;
+esac
