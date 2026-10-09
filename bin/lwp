@@ -116,13 +116,27 @@ guard_wp() {
 	fi
 }
 
+new_cookie() {
+	need_db
+	wpcli eval-file "$LIB/cookie.php" "$OUT/cookies.txt" >/dev/null || { echo "lwp: 產生 cookie 失敗" >&2; exit 5; }
+}
+
+# 用 cookie 實際請求後台，回 200 才代表登入有效（未登入時會被轉到登入頁，或被隱藏登入網址的外掛轉回首頁）
+cookie_valid() {
+	[ "$(curl -sk -b "$OUT/cookies.txt" -o /dev/null -w '%{http_code}' --max-time 60 "$(base_url)/wp-admin/profile.php")" = 200 ]
+}
+
+# 確保有可用的登入 cookie。加上 verify 參數時，會實際驗證登入工作階段：
+# 外掛更新、改密碼、登出所有裝置等操作會讓伺服器端的工作階段失效，cookie 雖未到期也已無法登入
 ensure_cookie() {
 	local meta="$OUT/cookies.txt.meta" now exp
 	now=$(date +%s)
 	exp=$(python -c "import json,sys;print(json.load(open(sys.argv[1]))['expires'])" "$meta" 2>/dev/null | tr -d $'\r'); exp=${exp:-0}
 	if [ ! -f "$OUT/cookies.txt" ] || [ "$exp" -lt $((now + 600)) ]; then
-		need_db
-		wpcli eval-file "$LIB/cookie.php" "$OUT/cookies.txt" >/dev/null || { echo "lwp: 產生 cookie 失敗" >&2; exit 5; }
+		new_cookie
+	elif [ "${1:-}" = verify ] && ! cookie_valid; then
+		echo "lwp: 登入工作階段已失效（可能是外掛更新或改過密碼），已重新產生 cookie" >&2
+		new_cookie
 	fi
 }
 
@@ -268,7 +282,14 @@ case "$CMD" in
 			[[ "$a" == --save=* ]] && save="${a#--save=}"
 			[[ "$a" == --grep=* ]] && greps+=("${a#--grep=}")
 		done
-		res=$(curl -sk -b "$OUT/cookies.txt" -o "$save" -w '%{http_code} %{size_download}B %{time_total}s' "$(base_url)$path")
+		fetch() { curl -sk -b "$OUT/cookies.txt" -o "$save" -w '%{http_code} %{size_download}B %{time_total}s' "$(base_url)$path"; }
+		res=$(fetch)
+		# 後台頁面被轉址時，先確認是不是登入工作階段失效；是的話重新產生 cookie 再請求一次
+		if [[ "$res" == 302* && "$path" == /wp-admin* ]] && ! cookie_valid; then
+			echo "lwp: 登入工作階段已失效（可能是外掛更新或改過密碼），重新產生 cookie 後重試" >&2
+			new_cookie
+			res=$(fetch)
+		fi
 		errs=$(grep -ciE '<b>(fatal error|parse error|warning|notice|deprecated)</b>|critical error|wp-die-message' "$save")
 		title=$(grep -o '<title>[^<]*' "$save" | head -1 | sed 's/<title>//; s/&lsaquo;.*//; s/&#8212;.*//')
 		echo "$res  PHP錯誤字樣:$errs  標題:$title  → $save"
@@ -296,7 +317,8 @@ case "$CMD" in
 		MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' node "$script" "$@"
 		;;
 	smoke|shot|run)
-		ensure_cookie; browser_start
+		# 瀏覽器測試動輒數十頁，先花一個請求確認登入有效，避免整輪都以未登入身分跑完
+		ensure_cookie verify; browser_start
 		export LWP_BASE="$(base_url)"
 		if [ "$CMD" = run ] && [ $# -gt 0 ]; then first="$(script_path "$1")"; shift; set -- "$first" "$@"; fi
 		node_run "$CMD" "$@"

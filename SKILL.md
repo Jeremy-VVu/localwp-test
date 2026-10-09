@@ -169,4 +169,5 @@ API：`open(url)`、`goto(page, url)`、`clickAndWait(page, selector|handle)`、
 - （Windows）呼叫 node 時已關閉 Git Bash 的路徑轉換，避免 `/wp-admin/...` 被改成 `C:/Program Files/Git/...`。
 - Windows 的 Python 輸出是 CRLF，lwp 讀取時已去除 `\r`。Windows 用 `python`，Linux／macOS 用 `python3`（自動選擇）。
 - `debug off`：如果開啟後 wp-config.php 沒被別人改過，就放回位元組完全一致的原檔；否則逐一還原常數。
+- 登入 cookie 除了到期會重新產生，伺服器端的工作階段失效時也會自動處理（外掛更新、改密碼、登出所有裝置都可能造成）：`get` 請求 `/wp-admin/...` 得到 302 時會驗證並重試一次；`smoke`／`shot`／`run` 開始前會先請求 `profile.php` 確認登入有效。看到「登入工作階段已失效」的訊息屬於正常。`lwp-browser` 每次 `open()` 都會重新設定 cookie，所以腳本裡清掉 cookie 不會影響之後的測試。
 - puppeteer-core 裝在 skill 目錄內（有自己的 package.json）。**不要**在沒有 package.json 的目錄執行 `npm i`，否則會裝進使用者家目錄。
