@@ -16,6 +16,7 @@
 - **自訂瀏覽器腳本**：`require('lwp-browser')`，底層是 puppeteer
 - **WP_DEBUG_LOG 開關與分組統計**：關閉時會放回位元組完全一致的原檔
 - **對外 HTTP 請求紀錄與封鎖**、**資料庫快照與還原**、**測試用暫存檔管理**
+- **被入侵站台的唯讀鑑識**：`files`、`stat`、`forensic scan|mtimes` 檢查 uploads 內的 PHP、mu-plugins、auto_prepend、隱藏檔、後門寫法與檔案時間分布；`forensic db|sql` 不載入 WordPress，直接讀資料庫，避免執行站台裡的惡意程式碼
 
 ## 支援平台
 

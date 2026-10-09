@@ -18,6 +18,7 @@ Everything goes through a single entry point, `bin/lwp`, so one permission rule 
 - **Custom browser scripts** via `require('lwp-browser')`, built on puppeteer.
 - **WP_DEBUG_LOG toggle and grouped summary**: turning it off restores a byte-identical copy of the original `wp-config.php`.
 - **Outbound HTTP request logging and blocking**, **database snapshots and restore**, and **temporary test file management**.
+- **Read-only forensics on compromised sites**: `files`, `stat` and `forensic scan|mtimes` check for PHP files in uploads, mu-plugins, auto_prepend directives, hidden files, common backdoor patterns and file timestamp distribution. `forensic db|sql` read the database directly without loading WordPress, so the site's malicious code never runs.
 
 ## Supported platforms
 

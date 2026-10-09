@@ -29,6 +29,13 @@ lwp — LocalWP 站台測試工具
   lwp <站台> node <腳本.js> [參數...]     執行 node 腳本（環境變數含 LWP_PUBLIC 等站台路徑；找不到時改找輸出目錄）
   lwp <站台> grep <正規式> [路徑...] [grep 選項]  唯讀搜尋（相對路徑以站台 public 為準，可用絕對路徑）
   lwp <站台> cat <檔案> [起-迄]           唯讀顯示檔案（含行號，預設前 200 行）
+  lwp <站台> files [路徑...] [--name=GLOB,..] [--after=/--before=YYYY-MM-DD] [--php] [--hidden] [--ww] [--sort=time|path|size] [--max=N]
+                                        唯讀列出檔案（修改時間、大小、權限），取代 find
+  lwp <站台> stat <檔案...>               唯讀顯示完整時間戳記、權限、md5、首行
+  lwp <站台> forensic scan [--ioc=正規式] [--since=YYYY-MM-DD]  檔案層入侵檢查（uploads PHP、mu-plugins、auto_prepend、隱藏檔、後門寫法）
+  lwp <站台> forensic mtimes [路徑...] [--by=day|month|hour] [--min=N] [--on=YYYY-MM-DD]  檔案修改時間分布
+  lwp <站台> forensic db [--keywords=正規式]  資料庫層入侵檢查（不載入 WordPress）
+  lwp <站台> forensic sql "<SELECT ...>"  唯讀查詢，但不載入 WordPress（被入侵的站台用這個，不用 sql）
   lwp <站台> tmp put <檔案...> --to=<wp-content 下的目錄>  放入測試用暫存檔並記錄（不覆蓋既有檔案）
   lwp <站台> tmp list|clear              列出／清除 lwp 放入的暫存檔（只刪內容未被改過的）
   lwp <站台> lint <目錄...> [--php=7.4,8.4]  PHP 語法檢查（預設用站台的 PHP 版本）
@@ -422,6 +429,25 @@ PY
 		range="${2:-1-200}"; from="${range%-*}"; to="${range#*-}"
 		awk -v a="$from" -v b="$to" 'NR>=a && NR<=b { printf "%6d│%s\n", NR, $0 } NR>b { exit }' "$f"
 		;;
+	files|stat)
+		# 唯讀：只讀取檔案資訊，不執行站台程式碼
+		[ "$CMD" = stat ] && [ $# -lt 1 ] && { echo "用法：lwp <站台> stat <檔案...>" >&2; exit 1; }
+		python "$LIB/forensic.py" "$LWP_PUBLIC" "$CMD" "$@"
+		;;
+	forensic)
+		sub="${1:-}"; [ $# -gt 0 ] && shift
+		case "$sub" in
+			scan|mtimes) python "$LIB/forensic.py" "$LWP_PUBLIC" "$sub" "$@" ;;
+			db|sql)
+				need_db
+				[ "$sub" = sql ] && [ $# -lt 1 ] && { echo "用法：lwp <站台> forensic sql \"<SELECT ...>\"" >&2; exit 1; }
+				# 用 Local 的 PHP 直接執行，不經過 WP-CLI，避免載入站台的 mu-plugins／外掛
+				php_exec "$LWP_PHP" -c "$LWP_PHP_INI" -d display_startup_errors=0 "$LIB/forensic-db.php" "$LWP_PUBLIC" "$LWP_DB_PORT" "$sub" "$@"
+				;;
+			*) echo "用法：lwp <站台> forensic scan|mtimes|db|sql ..." >&2; exit 1 ;;
+		esac
+		;;
+	help|-h|--help) usage ;;
 	tmp)
 		# 測試用暫存檔：放入時記錄路徑與 md5，清除時只刪「lwp 放的、內容沒被改過」的檔案
 		man="$OUT/tmp-manifest.tsv"; touch "$man"

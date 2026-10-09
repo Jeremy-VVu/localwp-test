@@ -1,6 +1,6 @@
 ---
 name: localwp-test
-description: 在 LocalWP（Local by Flywheel）的 WordPress 開發站上測試外掛或佈景主題：WP-CLI、唯讀 SQL、PHP 多版本語法檢查、以管理員身分請求頁面、無頭瀏覽器（Edge／Chrome）冒煙測試與截圖、自訂瀏覽器腳本、WP_DEBUG_LOG 開關、對外 HTTP 請求紀錄、資料庫快照。支援 Windows（Git Bash）、Linux、macOS。當使用者要在 LocalWP 站台上測試、驗證功能、檢查錯誤、跑 WP-CLI 或查資料庫時使用。站台通常是 *.local 網域，或位於 ~/Local Sites/<站台>、<任意目錄>/<站台>/app/public 這種 LocalWP 目錄結構。所有操作都透過單一入口 lwp，方便用一條權限規則免除確認提示。
+description: 在 LocalWP（Local by Flywheel）的 WordPress 開發站上測試外掛或佈景主題：WP-CLI、唯讀 SQL、PHP 多版本語法檢查、以管理員身分請求頁面、無頭瀏覽器（Edge／Chrome）冒煙測試與截圖、自訂瀏覽器腳本、WP_DEBUG_LOG 開關、對外 HTTP 請求紀錄、資料庫快照，以及在隔離的被入侵站台副本上做唯讀鑑識（檔案時間分布、uploads PHP、mu-plugins、後門寫法、不載入 WordPress 的資料庫檢查）。支援 Windows（Git Bash）、Linux、macOS。當使用者要在 LocalWP 站台上測試、驗證功能、檢查錯誤、跑 WP-CLI 或查資料庫時使用。站台通常是 *.local 網域，或位於 ~/Local Sites/<站台>、<任意目錄>/<站台>/app/public 這種 LocalWP 目錄結構。所有操作都透過單一入口 lwp，方便用一條權限規則免除確認提示。
 ---
 
 # LocalWP 測試（lwp）
@@ -30,15 +30,21 @@ description: 在 LocalWP（Local by Flywheel）的 WordPress 開發站上測試�
 | `cd 某目錄 && node 腳本.js` | `lwp <站台> node <腳本絕對路徑> [參數...]` |
 | `node <輸出目錄>/xxx.js`、`lwp run <完整路徑>` | `lwp <站台> run xxx.js`、`lwp <站台> node xxx.js`（找不到時自動找 `.lwp-test/`） |
 | `cp` 測試檔（譯檔、mu-plugin 等）到站台，測完再 `rm` | `lwp <站台> tmp put <檔案...> --to=<wp-content 下的目錄>`，測完 `lwp <站台> tmp clear` |
+| `find ... -newermt`、`find -name`、`ls -la` 找檔案 | `lwp <站台> files [路徑...] [--after=/--before=YYYY-MM-DD] [--name=GLOB,...] [--php] [--hidden] [--ww]` |
+| `stat`、`md5sum`、`ls --time-style=full-iso` | `lwp <站台> stat <檔案...>` |
+| `find ... -printf '%TY-%Tm-%Td' \| sort \| uniq -c` 統計修改時間 | `lwp <站台> forensic mtimes [路徑] [--by=day\|month\|hour] [--min=N]`（`--min` 只顯示檔案數 ≥ N 的時段，`--by=hour` 時建議加）；某天的檔案分布 `--on=YYYY-MM-DD` |
+| 被入侵站台用 `sql`（會載入 WordPress） | `lwp <站台> forensic sql "<SELECT ...>"`（直接連資料庫，不執行站台程式碼） |
+| `python -c` 解析站台裡的 JSON、換算時間戳記 | `lwp <站台> php -r '...'` |
 
-`grep`、`cat` 的相對路徑以站台的 `public` 為準（例如 `wp-content/plugins/xxx`），也可以用絕對路徑。
+`grep`、`cat`、`files`、`stat` 的相對路徑以站台的 `public` 為準（例如 `wp-content/plugins/xxx`），也可以用絕對路徑。
 
 ## 授權原則：除了刪除資料，其他都不用先問
 
 使用者的授權範圍是：**測試與開發相關操作都可以直接做，只有「刪除資料」要先取得同意。**
 
 可以直接做（不必詢問）：
-- 所有唯讀操作：`info`、`sql`、`get`、`grep`、`cat`、`lint`、`smoke`、`shot`、`run`、`debug status|log`、`httplog show`、`snapshot`（建立快照）、`tmp list`。
+- 所有唯讀操作：`info`、`sql`、`get`、`grep`、`cat`、`files`、`stat`、`forensic scan|mtimes|db|sql`、`lint`、`smoke`、`shot`、`run`、`debug status|log`、`httplog show`、`snapshot`（建立快照）、`tmp list`。
+- 對外查詢公開資訊：用 WebSearch／WebFetch 查外掛的已知漏洞（Wordfence Intelligence、Patchstack、WPScan）、changelog、惡意程式特徵。**不要**連到 IOC 裡的控制端網域。
 - 測試用的暫時狀態，以及還原這些狀態：`debug on|off|clear`、`httplog on|off|block|unblock|clear`、`browser start|stop`、`cleanup`。
 - 用 `tmp put` 放入測試檔、用 `tmp clear` 清除。`tmp clear` 只刪除 lwp 自己放入、而且內容沒被改過的檔案，因此**不算刪除使用者資料**。
 - 透過瀏覽器腳本或 WP-CLI 修改設定做測試（例如改選單標題後儲存）。**先 `snapshot` 並告訴使用者快照名稱。**
@@ -81,6 +87,34 @@ lwp 會擋下以下操作，必須加 `--lwp-yes` 才會執行：
 - `sql` 只允許單一的 SELECT／SHOW／DESCRIBE／EXPLAIN。要改資料請用 `wp option update`、`wp post meta` 等明確的 WP-CLI 指令，並在回報裡說明改了什麼。
 - `wp eval`／`wp eval-file`、`lwp node`、`lwp run` 都能執行任意程式，只用來讀取、測試或觸發外掛自己的程式。不要用它們刪除資料，也不要用來繞過上面的限制。
 - lwp 只會操作 LocalWP 的 sites.json 裡登記的本機站台，不能、也不要拿它去碰正式站。
+
+## 被入侵站台的鑑識（隔離副本）
+
+使用者把被入侵的站台備份還原到 Local，目的是在離線環境裡**找出入侵管道**，不是在副本上清理。這種站台的程式碼要當成惡意程式看待，規則比一般測試嚴格：
+
+**可以直接做（唯讀，不執行站台程式碼）：**
+- `forensic scan`、`forensic mtimes`、`files`、`stat`、`grep`、`cat`、`forensic db`、`forensic sql`：只讀檔案或直接讀資料庫。
+- 用 Read 讀取惡意檔案的原始碼來分析它的行為（控制端網址、植入方式、資料檔格式）。
+- `wp core verify-checksums`、`wp plugin verify-checksums --all`：WP-CLI 這兩個指令不會跑到前台程式，但仍會載入 mu-plugins，見下一點。
+
+**要先想過再做，並在回報中說明：**
+- 任何會載入 WordPress 的操作（`wp ...`、`sql`、`info`、`get`、`smoke`、`cookie`）都會執行 mu-plugins、啟用中的外掛與佈景主題，也就包含惡意程式碼。WP-CLI 的 `--skip-plugins --skip-themes` **擋不到 mu-plugins**。查資料庫一律優先用 `forensic db`／`forensic sql`。
+- 必須載入 WordPress 時（例如跑 checksums），先執行 `lwp <站台> httplog block <IOC 裡的控制端網域>`，再用 `httplog show` 確認有沒有對外連線。
+
+**不要做：**
+- 不要用 `get`、`smoke`、瀏覽器或 `php` 去請求或執行惡意檔案本身（例如 `uploads/xxx.php`），它可能會回報給控制端或改寫其他檔案。
+- 不要刪除或修改惡意檔案：副本是證據。使用者要清理時，處理的是正式站，不是這份副本。
+- 不要連到 IOC 裡的網域（WebFetch、curl 都不行）；查詢情資用搜尋引擎即可。
+
+**建議流程：**
+1. 先讀專案 `docs/` 裡的事件報告與 IOC，把控制端網域、檔名、特徵字串整理成 `--ioc` 正規式。
+2. `forensic scan --ioc="<IOC 正規式>"`：uploads 內的 PHP、mu-plugins、wp-content 根目錄 PHP、auto_prepend／Handler、不認識的隱藏檔、後門寫法、超長行。
+3. 讀惡意檔案的資料檔（例如連線設定、連結清單）找時間線索。檔案時間戳記常被搬站或還原改寫，**資料檔裡記錄的 Unix 時間**通常比較可信，用 `lwp <站台> php -r 'echo date("c", 1778279937);'` 換算。
+4. `forensic mtimes`，再用 `forensic mtimes wp-content --on=<可疑日期>` 看那天有哪些檔案一起被改。整批外掛同一秒被改通常是搬站、還原或更新；只有零星幾個檔案時才值得細看。
+5. `forensic db`：管理員帳號、cron、啟用中的外掛、最近停用的外掛、options／文章／postmeta 的可疑內容、可用的紀錄表。
+6. 翻資安外掛留下的紀錄（`forensic sql`）：Wordfence 的 `wfstatus`（每次掃描「添加问题／Adding issue」的檔案與時間）、`wflogins`（登入，IP 欄位是二進位）、`wfhits`；Simple History；Limit Login Attempts／All In One Login 的登入紀錄；WP Statistics 的 `statistics_pages` 只記前台頁面瀏覽，看不到直接請求 PHP 的紀錄。
+7. 比對外掛版本與已知漏洞：`wp plugin verify-checksums --all` 找被改過的檔案；付費外掛無法比對，就看有沒有破解版跡象；用 WebSearch 查各外掛在入侵時間點之前的漏洞，並確認漏洞的前提條件（例如需要特定表單欄位）在這個站台是否成立。
+8. 記得標明限制：`.wpress` 等備份通常**不含 WordPress 核心與伺服器存取日誌**，核心比對與存取日誌追查要到原主機做；Windows 上沒有 Unix 權限，777 檢查也要到原主機做。
 
 ## 自訂瀏覽器腳本（lwp run）
 
