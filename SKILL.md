@@ -35,6 +35,7 @@ description: 在 LocalWP（Local by Flywheel）的 WordPress 開發站上測試�
 | `find ... -printf '%TY-%Tm-%Td' \| sort \| uniq -c` 統計修改時間 | `lwp <站台> forensic mtimes [路徑] [--by=day\|month\|hour] [--min=N]`（`--min` 只顯示檔案數 ≥ N 的時段，`--by=hour` 時建議加）；某天的檔案分布 `--on=YYYY-MM-DD` |
 | 被入侵站台用 `sql`（會載入 WordPress） | `lwp <站台> forensic sql "<SELECT ...>"`（直接連資料庫，不執行站台程式碼） |
 | `python -c` 解析站台裡的 JSON、換算時間戳記 | `lwp <站台> php -r '...'` |
+| `python .../mosaic-headless-main/tools/build_site.py --config ... --site ...` | `lwp <站台> mosaic-build <site.json> [--dry-run]` |
 
 `grep`、`cat`、`files`、`stat` 的相對路徑以站台的 `public` 為準（例如 `wp-content/plugins/xxx`），也可以用絕對路徑。
 
@@ -49,11 +50,20 @@ description: 在 LocalWP（Local by Flywheel）的 WordPress 開發站上測試�
 - 用 `tmp put` 放入測試檔、用 `tmp clear` 清除。`tmp clear` 只刪除 lwp 自己放入、而且內容沒被改過的檔案，因此**不算刪除使用者資料**。
 - 透過瀏覽器腳本或 WP-CLI 修改設定做測試（例如改選單標題後儲存）。**先 `snapshot` 並告訴使用者快照名稱。**
 - 測完把資料庫還原成「同一段工作中、測試前自己建立的快照」，以撤銷自己的測試改動。這時仍需加 `--lwp-yes`，但不必再問；回報時要說明還原了哪個快照。
+- 用 `lwp run` 的瀏覽器腳本開啟**外部公開網站**做唯讀擷取：參考版型截圖、量測動畫（transform／opacity 取樣）、抓文字與圖片／影片網址、讀樣式表與 keyframes。被擋 headless 時可改用一般瀏覽器的 User-Agent。只讀不寫：不登入、不送出表單、不大量爬取；也可以用 curl 檢查外部資源（CDN、媒體網址）是否可用。
+- 用 `wp eval-file` 執行開發工具自己的腳本，例如 mosaic-headless 的 `mint_session.php`（產生管理員的 REST cookie 與 nonce）、`prune_unbound.php` 的 dry run。產生的憑證只放在 session 的暫存目錄，不寫進專案、不提交。
+- 在本機站台用頁面建構工具建立或重建頁面、template、master。mosaic-headless 的 `build_site.py` **一律透過 `lwp <站台> mosaic-build <site.json>` 執行**，不要直接 `python build_site.py`：
+  - 它只接受這個本機站台網域的 session（自動用 `mint_session.php` 產生，存在 `.lwp-test/mosaic-session.json`；`--config=` 給的設定檔 `base` 不是本機網域就拒絕），所以碰不到正式站。
+  - 先跑 `--dry-run` 看「會換掉的頁面」：每個頁面會綁到新建的範本，舊範本不刪，但使用者在編輯器裡的修改會從畫面上消失。頁面有編輯器修改、或產生器已經跟網站不同步時，**先問使用者**再正式執行。
+  - 正式執行時自動建快照 `mosaic-build-<時間>` 並列出新建的母版／範本；回報時告訴使用者快照名稱。建完要用瀏覽器實際檢查（桌機與手機寬度、console 錯誤、互動、未登入時的 HTTP 狀態）。
+- 執行頁面產生器 `build_spec.py`：它只讀同資料夾的 `content.json`、寫出 `site.json`，不連網、不碰站台。使用者在 `~/.claude/settings.json` 允許了 `Bash(python D:/Sync-folder/Dev/local/*/mosaic/*/build_spec.py)`，所以要**單獨一條** `python <絕對路徑>/build_spec.py`，不要 `cd ... &&`、不要加 `PYTHONIOENCODING=` 之類的前綴（需要 UTF-8 輸出就在腳本裡 `sys.stdout.reconfigure`）。把 `site.json` 寫進站台的 `build_site.py` 不在這條規則內，照上一條先建快照。產生器若改成會連網、寫站台或刪檔，就不再適用這條，要先說明。
 
 必須先取得使用者明確同意（同意後才加 `--lwp-yes`）：
 - 刪除任何不是 lwp 自己建立的東西：外掛、佈景主題、使用者、文章、選項、meta、資料表、檔案。
 - 還原「不是這段工作中自己建立的」快照，或任何會覆蓋使用者資料的匯入。
 - `tmp clear` 回報「保留（內容被修改）」的檔案：不要自行刪除，交給使用者決定。
+- 清理建置留下的資料（例如 `prune_unbound.php --apply` 刪除沒綁定的 template／master／節點）：即使是自己建出來的也要先問，因為同一批裡可能混著不是這次工作建立的資料。
+- 修改使用者自己的外掛設定來配合新版型（例如關掉某頁的背景效果）：先說明衝突，讓使用者決定。
 
 lwp 會擋下以下操作，必須加 `--lwp-yes` 才會執行：
 - `db reset|drop|clean|import`、`site empty|delete`、`plugin delete|uninstall`、`theme delete`、`user delete`、`core update|download`、沒加 `--dry-run` 的 `search-replace`。
@@ -79,6 +89,25 @@ lwp 會擋下以下操作，必須加 `--lwp-yes` 才會執行：
 8. 結束時執行 `lwp <站台> cleanup`：還原 wp-config.php、移除 HTTP 紀錄器、清除 tmp 暫存檔、關閉瀏覽器。
 
 輸出（cookie、截圖 `shots/`、`last-get.html`、資料庫快照、自訂腳本）都放在 `<站台>/app/.lwp-test/`。這個目錄不在 public 底下，網站無法存取。截圖可以用 Read 工具查看；如果被「只能讀工作目錄」擋住，就請使用者在 `<站台>/app` 開啟 Claude Code，或執行 `/add-dir`。
+
+## 用頁面建構工具建版：讓編輯器改得動
+
+不論用哪個 skill 或工具寫入頁面（各作者習慣不同），使用者之後通常會在視覺編輯器裡自己調整。建版時就要確認「編輯器改得動」，不要只看前台長得對不對。
+
+- **字體與邊界寫在節點自己的樣式**（例如 Mosaic spec 的 `style`，支援 `_`／`_t`／`_m` 斷點），不要寫在 code 節點或 `<style>` 的全域 CSS。頁面自己的 `<style>` 排在編輯器樣式後面，用 ID 選擇器更是 (1,0,0) 權重，使用者在面板設的字重、字級、邊界會全部被蓋掉，面板看起來有設、畫面卻不變。
+- 全域 CSS 只放編輯器做不到的：動畫與 keyframes、捲動效果、偽元素裝飾、hover 光暈、第三方函式庫需要的樣式。顏色、版面若也寫在全域 CSS，要在交付時告訴使用者「這幾類在編輯器改不會生效」。
+- 文字要放在編輯器認得的結構裡，例如 Mosaic 的按鈕是「按鈕 > 文字（繼承的文字）> 內文」；少一層前台照樣顯示，但編輯器沒有東西可以改。建完拿一個編輯器裡手動拉出來的同類元素，比對資料結構。
+- 驗收時除了前台截圖，也請使用者（或自己用編輯器）實際改一個字、一個字重、一個邊界，確認有生效。
+
+已經用全域 CSS 建好的頁面要改回節點樣式時：
+1. 先 `snapshot`。依 CSS 層疊規則（權重、順序、斷點）算出每個節點最後的值再寫入，不要逐條照搬。使用者已經在編輯器設的值一律保留。
+2. 前後都在桌機、平板、手機三個寬度擷取整頁 computed style 逐一比對，只能剩下使用者自己設定造成的差異。
+3. 使用者在編輯器設過、以前被全域 CSS 蓋住的值，搬完會一起生效，可能出現意外（例如只在桌機合理的固定邊界，手機變成水平捲動）。比對完要列給使用者決定。
+
+Mosaic 實測（Pro 1.0.11，2026-10-27）：
+- 節點樣式的 `fontWeight`、`letterSpacing` 寫 `inherit` 時，儲存會被整個丟掉；`fontFamily`、`fontSize`、`lineHeight` 的 `inherit` 會保留。要繼承的字重、字距只能寫實際值（字距用 em 才會跟著字級縮放）。
+- Mosaic 先輸出全部基本樣式（variant、節點），再輸出斷點區塊。所以預設 variant 在斷點裡的值會蓋掉節點只寫在基本斷點的值：`.m-section` 平板內距、`.m-menu-link` 手機左右內距、`.m-button{width:100%}`。節點要在那個斷點也寫一次。
+- 外掛的 `public/style.css` 還會給 `.m-button` 加 `display:flex`、`align-items:center`、`row-gap`，前台 HTML 裡看不到，要用 computed style 才查得到。
 
 ## 安全規則（必須遵守）
 

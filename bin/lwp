@@ -53,6 +53,8 @@ lwp — LocalWP 站台測試工具
   lwp <站台> snapshot [名稱]|list         以 wp db export 備份資料庫
   lwp <站台> restore <名稱> --lwp-yes     還原資料庫快照（破壞性）
   lwp <站台> cleanup                     debug off + httplog off + tmp clear + browser stop
+  lwp <站台> mosaic-build <site.json> [--config=設定] [--user=帳號] [--dry-run]
+                                        用 mosaic-headless 的 build_site.py 寫入本機站台（只接受本機網域、先列出會換掉的頁面、自動建快照）
 
 輸出目錄：<站台>/app/.lwp-test（可用 LWP_OUT 覆寫）
 EOF
@@ -468,6 +470,54 @@ PY
 				;;
 			*) echo "用法：lwp <站台> forensic scan|mtimes|db|sql ..." >&2; exit 1 ;;
 		esac
+		;;
+	mosaic-build)
+		# 用 mosaic-headless 的 build_site.py 把 site spec 寫進「這個本機站台」：
+		# 只接受本機站台網域的 session、先列出會換掉的頁面、自動建快照，再執行
+		site_json=""; cfg_in=""; tools="${LWP_MOSAIC_TOOLS:-$HOME/.claude/skills/mosaic-headless-main/tools}"; dry=0; mb_user=""
+		for a in "$@"; do case "$a" in
+			--config=*) cfg_in="${a#--config=}" ;; --tools=*) tools="${a#--tools=}" ;; --user=*) mb_user="${a#--user=}" ;;
+			--dry-run) dry=1 ;; -*) echo "lwp: 未知選項 $a" >&2; exit 1 ;; *) site_json="$a" ;;
+		esac; done
+		[ -z "$site_json" ] && { echo "用法：lwp <站台> mosaic-build <site.json> [--config=<session 設定>] [--user=<帳號>] [--tools=<目錄>] [--dry-run]" >&2; exit 1; }
+		[ -f "$site_json" ] || { echo "lwp: 找不到 $site_json" >&2; exit 1; }
+		[ -f "$tools/build_site.py" ] || { echo "lwp: 找不到 $tools/build_site.py（可用 --tools= 或 LWP_MOSAIC_TOOLS 指定）" >&2; exit 1; }
+		need_db
+		mb_ver="$(wpcli plugin get mosaic --field=version 2>/dev/null | tr -d $'\r')"
+		[ -z "$mb_ver" ] && { echo "lwp: 站台沒有安裝 Mosaic 外掛" >&2; exit 1; }
+		mb_theme="$(wpcli option get stylesheet 2>/dev/null | tr -d $'\r' | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')"
+		[ -z "$mb_theme" ] && { echo "lwp: 啟用中的佈景主題不是 Mosaic 佈景主題，停止" >&2; exit 1; }
+		cfg="$OUT/mosaic-session.json"
+		if [ -n "$cfg_in" ]; then
+			python "$LIB/mosaic_build.py" check "$cfg_in" "$cfg" "$LWP_DOMAIN" "$mb_theme" "$mb_ver" || exit 1
+		else
+			mint="$(wpcli eval-file "$tools/mint_session.php" $mb_user 2>/dev/null | tr -d $'\r')"
+			MB_COOKIE="$(sed -n 's/^COOKIE=//p' <<<"$mint")" MB_NONCE="$(sed -n 's/^NONCE=//p' <<<"$mint")" \
+			MB_SITEURL="$(sed -n 's/^SITEURL=//p' <<<"$mint")" MB_THEME="$mb_theme" MB_VERSION="$mb_ver" MB_DOMAIN="$LWP_DOMAIN" \
+				python "$LIB/mosaic_build.py" mint "$cfg" || { echo "lwp: 產生 session 失敗：$(head -c 200 <<<"$mint")" >&2; exit 1; }
+		fi
+		echo "站台：$LWP_DOMAIN　Mosaic $mb_ver　佈景主題 $mb_theme"
+		pages="$(python "$LIB/mosaic_build.py" pages "$site_json")" || exit 1
+		echo "母版：$(sed -n 's/^master\t//p' <<<"$pages")　元件：$(sed -n 's/^components\t//p' <<<"$pages") 個（重建時元件內原有的節點會先刪掉再寫入）"
+		ids="$(awk -F'\t' '$1=="page"&&$2!=""{printf "%s%s",(n++?",":""),$2}' <<<"$pages")"
+		echo "會換掉的頁面（綁到新建的範本；舊範本不刪，畫面上會看不到編輯器裡的修改）："
+		while IFS=$'\t' read -r kind pid slug title; do
+			[ "$kind" = page ] || continue
+			cur="$(wpcli eval-file "$LIB/sql.php" "SELECT CONCAT(LEFT(t.ID,8),' ',t.name,'（母版 ',IFNULL(m.name,'?'),'）') FROM {prefix}mosaic_template_assigns a JOIN {prefix}mosaic_templates t ON t.ID=a.parentID AND t.themeID=a.themeID LEFT JOIN {prefix}mosaic_masters m ON m.ID=t.masterID AND m.themeID=t.themeID WHERE a.themeID='$mb_theme' AND a.type='post' AND a.typeIdentifier='$pid' AND a.parentType='template'" csv 2>/dev/null | tr -d $'\r' | tail -n +2 | head -1)"
+			echo "  post $pid　$slug　$title　目前：${cur:-（沒有範本）}"
+		done <<<"$pages"
+		[ "$dry" = 1 ] && { echo "（--dry-run：沒有建快照，也沒有寫入）"; exit 0; }
+		snap="mosaic-build-$(date +%Y%m%d-%H%M%S)"
+		"$0" "$SITE" snapshot "$snap" || { echo "lwp: 快照失敗，不執行建置" >&2; exit 1; }
+		before="$OUT/.mosaic-build-before.csv"
+		wpcli eval-file "$LIB/sql.php" "SELECT 'master',ID,name FROM {prefix}mosaic_masters WHERE themeID='$mb_theme' UNION ALL SELECT 'template',ID,name FROM {prefix}mosaic_templates WHERE themeID='$mb_theme'" csv 2>/dev/null | tr -d $'\r' >"$before"
+		python "$tools/build_site.py" --config "$cfg" --site "$site_json"; rc=$?
+		echo "新建的母版／範本："
+		wpcli eval-file "$LIB/sql.php" "SELECT 'master',ID,name FROM {prefix}mosaic_masters WHERE themeID='$mb_theme' UNION ALL SELECT 'template',ID,name FROM {prefix}mosaic_templates WHERE themeID='$mb_theme'" csv 2>/dev/null | tr -d $'\r' | grep -vxF -f "$before" | sed 's/^/  /'
+		echo "建置前的快照：$snap（還原：lwp $SITE restore $snap --lwp-yes，需使用者同意）"
+		echo "之前綁定這些頁面的舊範本與母版沒有刪除；要清理請先取得使用者同意。"
+		rm -f "$before"
+		exit $rc
 		;;
 	help|-h|--help) usage ;;
 	tmp)
